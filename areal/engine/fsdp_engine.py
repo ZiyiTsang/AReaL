@@ -47,7 +47,11 @@ from areal.utils.data import (
 from areal.utils.distributed import init_custom_process_group
 from areal.utils.fsdp import fsdp2_load_full_state_dict
 from areal.utils.fsdp.grad import fsdp2_clip_grad_norm
-from areal.utils.fsdp.optimizer import AnyPrecisionAdamW
+from areal.utils.fsdp.optimizer import (
+    AnyPrecisionAdamW,
+    MuonWithAuxAdam,
+    PrepareParamGroupsForMuon,
+)
 from areal.utils.fsdp.parallel import ParallelHelper, parallelize_model
 from areal.utils.nccl import NCCL_DEFAULT_TIMEOUT
 from areal.utils.save_load import get_state_dict_from_repo_id_or_path
@@ -743,8 +747,9 @@ class FSDPEngine(BaseHFEngine):
             "adam",
             "adam_bf16",
             "sgd",
+            "moun_adam",
         ], "Only adam/adam_bf16/sgd optimizer is supported in this engine."
-        if self.optimizer_config.type in ["sgd", "adam_bf16"]:
+        if self.optimizer_config.type in ["sgd", "adam_bf16", "moun_adam"]:
             self.logger.warning(
                 f"Using the '{self.optimizer_config.type}' optimizer with FSDP may be less stable. Consider using the 'adam' (AdamW) optimizer for improved stability and performance."
             )
@@ -753,31 +758,41 @@ class FSDPEngine(BaseHFEngine):
         beta1 = self.optimizer_config.beta1
         beta2 = self.optimizer_config.beta2
         eps = self.optimizer_config.eps
-        if self.optimizer_config.type == "adam":
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                betas=(beta1, beta2),
-                eps=eps,
-                fused=True,
-            )
-        elif self.optimizer_config.type == "adam_bf16":
-            self.optimizer = AnyPrecisionAdamW(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-                betas=(beta1, beta2),
-                eps=eps,
-                momentum_dtype="bfloat16",
-                variance_dtype="bfloat16",
-            )
-        else:
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=lr,
-                weight_decay=weight_decay,
-            )
+        match self.optimizer_config.type:
+            case "adam":
+                self.optimizer = torch.optim.AdamW(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    betas=(beta1, beta2),
+                    eps=eps,
+                    fused=True,
+                )
+            case "adam_bf16":
+                self.optimizer = AnyPrecisionAdamW(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    betas=(beta1, beta2),
+                    eps=eps,
+                    momentum_dtype="bfloat16",
+                    variance_dtype="bfloat16",
+                )
+            case "sgd":
+                self.optimizer = torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=lr,
+                    weight_decay=weight_decay,
+                )
+            case "moun_adam":
+                param_groups = PrepareParamGroupsForMuon(
+                    self.model, self.optimizer_config
+                )
+                self.optimizer = MuonWithAuxAdam(param_groups)
+            case _:
+                raise ValueError(
+                    f"Unsupported optimizer type {self.optimizer_config.type}"
+                )
         total_train_steps = ft_spec.total_train_steps
         num_warmup_steps = int(
             self.optimizer_config.warmup_steps_proportion * total_train_steps
