@@ -394,8 +394,8 @@ class ArchonEngineConfig:
     attn_type: str = field(
         default="varlen",
         metadata={
-            "help": "Attention backend type.",
-            "choices": ["varlen", "sdpa"],
+            "help": "Attention backend type. Use 'tree' for tree training.",
+            "choices": ["varlen", "sdpa", "tree"],
         },
     )
 
@@ -876,9 +876,7 @@ class TrainEngineConfig:
     # Tree training
     enable_tree_training: bool = field(
         default=False,
-        metadata={
-            "help": "Enable tree training with flex attention module. Not supported for Archon engine yet."
-        },
+        metadata={"help": "Enable tree training with flex attention module."},
     )
 
     # Scheduling

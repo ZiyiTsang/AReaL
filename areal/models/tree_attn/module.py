@@ -32,6 +32,9 @@ except ImportError:
     PytorchFlexAttention = None
     patch_bridge_for_tree_training = None
 
+# Archon functionality
+from areal.models.tree_attn.module_archon import TreeAttentionWrapper
+
 __all__ = [
     # Shared constants
     "BLOCK_SIZE",
@@ -50,4 +53,6 @@ __all__ = [
     # Megatron exports (may be None if Megatron not installed)
     "PytorchFlexAttention",
     "patch_bridge_for_tree_training",
+    # Archon exports
+    "TreeAttentionWrapper",
 ]
