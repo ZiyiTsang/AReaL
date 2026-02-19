@@ -12,7 +12,6 @@ import requests
 from areal.api.alloc_mode import AllocationMode
 from areal.api.cli_args import (
     ClusterSpecConfig,
-    GenerationHyperparameters,
     NameResolveConfig,
     SGLangConfig,
     parse_cli_args,

@@ -575,6 +575,7 @@ https://github.com/sgl-project/sglang for detailed documentation.
 | `enable_metrics`                  | boolean                 | `True`       | -           |
 | `decode_log_interval`             | integer                 | `1`          | -           |
 | `enable_multithread_load`         | boolean                 | `False`      | -           |
+| `enable_return_routed_experts`    | boolean                 | `False`      | -           |
 
 (section-v-llm)=
 
@@ -747,7 +748,7 @@ Configuration for SwanLab experiment tracking and monitoring.
 | `config`  | `dict` \| None | `None`                    | -           |
 | `logdir`  | string \| None | `None`                    | -           |
 | `mode`    | string \| None | `"disabled"`              | -           |
-| `api_key` | string \| None | `None` | -           |
+| `api_key` | string \| None | `"4KHJ20cRg6fuVkvwvGaXD"` | -           |
 
 (section-tensor-board)=
 

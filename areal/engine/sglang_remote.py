@@ -88,11 +88,13 @@ class SGLangBackend:
         # Extract routed_experts information if available
         routed_experts = meta_info.get("routed_experts", None)
         if routed_experts is not None:
-            num_sgl_token=meta_info['prompt_tokens'] + meta_info['completion_tokens']-1
+            num_sgl_token = (
+                meta_info["prompt_tokens"] + meta_info["completion_tokens"] - 1
+            )
             # Extract expert_id and reshape to (num_sgl_token, num_layers*expert_top_k)
             routed_experts = np.frombuffer(
                 pybase64.b64decode(routed_experts.encode("utf-8")), dtype=np.int32
-            ).reshape(num_sgl_token,-1)
+            ).reshape(num_sgl_token, -1)
 
         if stop_reason == "abort" and stop_message.startswith("Abort before prefill"):
             return HttpGenerationResult(
