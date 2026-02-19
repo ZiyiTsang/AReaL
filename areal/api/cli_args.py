@@ -185,7 +185,7 @@ class GenerationHyperparameters:
     return_routed_experts: bool = field(
         default=False,
         metadata={
-            "help": "Return routed expert indices for MoE models. This should not be manually set and will be handled internally."
+            "help": "Return routed expert indices for MoE models. Effective only when using SGLang engine with MoE models and use_beam_search=False."
         },
     )
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
