@@ -141,6 +141,63 @@ def _compute_sequence_level_ratio_and_advantages(
     return ratio, advantages
 
 
+def compute_is_ratio_with_engine_is(
+    training_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    mode: str,
+    cap: float,
+    loss_mask: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute importance sampling ratio with TIS/MIS correction.
+
+    This computes the IS ratio between training (recomputed) logprobs and inference logprobs
+    to correct for train-inference mismatch. The ratio is computed as:
+        is_ratio = exp(training_logprobs - inference_logprobs)
+
+    Args:
+        training_logprobs: Proximal/training logprobs (recomputed from training engine)
+        inference_logprobs: Old inference logprobs (from rollout)
+        mode: TIS/MIS mode - "token_truncate", "token_mask", "sequence_truncate", "sequence_mask"
+        cap: Cap value - tokens/sequences with ratio > cap are truncated or masked
+        loss_mask: Boolean mask for valid tokens
+        cu_seqlens: Cumulative sequence lengths (required for 1D packed format)
+
+    Returns:
+        IS ratio tensor with same shape as logprobs
+    """
+    # Compute raw IS ratio: exp(prox_logp - old_logp)
+    is_log_ratio = training_logprobs - inference_logprobs
+
+    if "sequence" in mode:
+        # Sequence-level: compute geometric mean ratio per sequence first
+        # Use a dummy advantages tensor (all zeros) since we only need the ratio
+        dummy_advantages = torch.zeros_like(is_log_ratio)
+        is_ratio_seq, _ = _compute_sequence_level_ratio_and_advantages(
+            is_log_ratio,
+            dummy_advantages,
+            loss_mask,
+            cu_seqlens,
+        )
+
+        # Now apply cap/mask on sequence-level ratio
+        if "truncate" in mode:
+            is_ratio_seq = is_ratio_seq.clamp(min=0.0, max=cap)
+        else:  # mask
+            is_ratio_seq = torch.where(is_ratio_seq > cap, 0.0, is_ratio_seq)
+
+        # Apply loss_mask to get final output
+        return torch.where(loss_mask, is_ratio_seq, 0.0)
+    else:
+        # Token-level
+        is_ratio = torch.exp(is_log_ratio)
+        if "truncate" in mode:
+            is_ratio = is_ratio.clamp(min=0.0, max=cap)
+        else:  # mask
+            is_ratio = torch.where(is_ratio > cap, 0.0, is_ratio)
+        return torch.where(loss_mask, is_ratio, 0.0)
+
+
 def ppo_actor_loss_fn(
     logprobs: torch.Tensor,
     proximal_logprobs: torch.Tensor,
@@ -153,6 +210,9 @@ def ppo_actor_loss_fn(
     behav_imp_weight_cap: float | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
+    engine_is_correction: bool = False,
+    engine_is_mode: str = "sequence_mask",
+    engine_is_cap: float = 3.0,
 ) -> tuple[torch.Tensor, dict]:
     """
     When decoupled loss is disabled:
@@ -170,6 +230,9 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
+        engine_is_correction: Enable TIS/MIS correction for train-inference mismatch.
+        engine_is_mode: Mode for IS correction - "token_truncate", "token_mask", "sequence_truncate", "sequence_mask"
+        engine_is_cap: Cap value for IS correction.
     """
     loss_mask_count = loss_mask.count_nonzero() or 1
 
@@ -187,6 +250,20 @@ def ppo_actor_loss_fn(
             f"Invalid importance_sampling_level: {importance_sampling_level}. "
             "Must be 'token' or 'sequence'."
         )
+
+    # TIS/MIS: Compute IS ratio for train-inference mismatch correction
+    # This is different from the PPO ratio - it compares training vs inference logprobs
+    if engine_is_correction:
+        is_ratio = compute_is_ratio_with_engine_is(
+            training_logprobs=proximal_logprobs,
+            inference_logprobs=old_logprobs,
+            mode=engine_is_mode,
+            cap=engine_is_cap,
+            loss_mask=loss_mask,
+            cu_seqlens=cu_seqlens,
+        )
+    else:
+        is_ratio = None
 
     clipped_ratio = torch.clamp(
         ratio,
@@ -215,6 +292,11 @@ def ppo_actor_loss_fn(
     behav_kl = torch.where(behav_mask, behav_kl, 0.0)
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
+
+    # Apply TIS/MIS correction: multiply by IS ratio for train-inference mismatch
+    if is_ratio is not None:
+        pg_loss = pg_loss * is_ratio
+
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
     clip_mask.logical_and_(loss_mask)
@@ -230,6 +312,8 @@ def ppo_actor_loss_fn(
         stat["behave_imp_weight"] = behav_imp_weight
         stat["behave_approx_kl"] = behav_kl
         stat["behave_mask"] = behav_mask
+    if is_ratio is not None:
+        stat["engine_is_ratio"] = is_ratio
     return pg_loss, stat
 
 

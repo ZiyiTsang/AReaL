@@ -336,6 +336,9 @@ class PPOActor:
                         sapo_tau_pos=self.config.sapo_tau_pos,
                         sapo_tau_neg=self.config.sapo_tau_neg,
                         use_decoupled_loss=self.config.use_decoupled_loss,
+                        engine_is_correction=self.config.engine_is_correction,
+                        engine_is_mode=self.config.engine_is_mode,
+                        engine_is_cap=self.config.engine_is_cap,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
@@ -369,6 +372,9 @@ def grpo_loss_fn(
     sapo_tau_pos: float = 1.0,
     sapo_tau_neg: float = 1.05,
     use_decoupled_loss: bool = False,
+    engine_is_correction: bool = False,
+    engine_is_mode: str = "sequence_mask",
+    engine_is_cap: float = 3.0,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
 ):
@@ -425,6 +431,9 @@ def grpo_loss_fn(
             behav_imp_weight_cap=behav_imp_weight_cap,
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
+            engine_is_correction=engine_is_correction,
+            engine_is_mode=engine_is_mode,
+            engine_is_cap=engine_is_cap,
         )
 
     # Log training statistics
@@ -456,6 +465,13 @@ def grpo_loss_fn(
             behave_imp_weight=stat["behave_imp_weight"],
             behave_approx_kl=stat["behave_approx_kl"],
             denominator="unclipped_behave_tokens",
+        )
+
+    # Log TIS/MIS engine IS ratio statistics
+    if "engine_is_ratio" in stat and engine_is_correction:
+        stats_tracker.stat(
+            engine_is_ratio=stat["engine_is_ratio"],
+            denominator="n_valid_tokens",
         )
 
     if vocab_min_logits is not None and vocab_max_logits is not None:

@@ -1030,6 +1030,37 @@ class PPOActorConfig(TrainEngineConfig):
             "choices": ["token", "sequence"],
         },
     )
+    # TIS/MIS: Training-Inference Matching Importance Sampling
+    engine_is_correction: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable importance sampling correction for train-inference mismatch (TIS/MIS). "
+            "Requires use_decoupled_loss=True or prox_logp_method='recompute'."
+        },
+    )
+    engine_is_mode: str = field(
+        default="sequence_mask",
+        metadata={
+            "help": "Importance sampling correction mode for train-inference mismatch. "
+            "'token_truncate': clamp token ratio to [0, cap]. "
+            "'token_mask': set token ratio to 0 where ratio > cap. "
+            "'sequence_truncate': clamp sequence ratio to [0, cap]. "
+            "'sequence_mask': set sequence ratio to 0 where ratio > cap (default).",
+            "choices": [
+                "token_truncate",
+                "token_mask",
+                "sequence_truncate",
+                "sequence_mask",
+            ],
+        },
+    )
+    engine_is_cap: float = field(
+        default=3.0,
+        metadata={
+            "help": "Cap value for importance sampling correction. "
+            "Tokens/sequences with ratio > cap are truncated or masked based on engine_is_mode."
+        },
+    )
     # Proximal Log-Probability Computation Method
     prox_logp_method: str = field(
         default=PROX_LOGP_METHOD_RECOMPUTE,
@@ -1070,6 +1101,17 @@ class PPOActorConfig(TrainEngineConfig):
         return (self.use_decoupled_loss and not method.skips_forward_pass()) or (
             not self.use_decoupled_loss and self.recompute_logprob
         )
+
+    def __post_init__(self):
+        """Validate TIS/MIS configuration."""
+        if self.engine_is_correction:
+            if not self.use_decoupled_loss and self.prox_logp_method != "recompute":
+                raise ValueError(
+                    "engine_is_correction=True requires either "
+                    "use_decoupled_loss=True or prox_logp_method='recompute'. "
+                    f"Got use_decoupled_loss={self.use_decoupled_loss}, "
+                    f"prox_logp_method='{self.prox_logp_method}'"
+                )
 
 
 @dataclass
