@@ -1670,7 +1670,12 @@ class SwanlabConfig:
     config: dict | None = None
     logdir: str | None = None
     mode: str | None = "disabled"
-    api_key: str | None = os.getenv("SWANLAB_API_KEY", None)
+    # set None to prevent info-leak in docs
+    api_key: str | None = None
+
+    def __post_init__(self):
+        if self.api_key is None:
+            self.api_key = os.getenv("SWANLAB_API_KEY")
 
 
 @dataclass
