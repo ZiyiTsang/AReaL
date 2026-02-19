@@ -32,7 +32,7 @@ check_expert_update() {
 
     # FSDP Engine related
     if [[ "$file" == *"areal/engine/fsdp_engine"* ]] || \
-       [[ "$file" == *"areal/utils/fsdp/"* ]]; then
+       [[ "$file" == *"areal/engine/fsdp_utils/"* ]]; then
         reminder_file="fsdp-engine-expert.md"
         reminder_desc="FSDP"
     fi
@@ -44,7 +44,7 @@ check_expert_update() {
     fi
 
     # Algorithm related (PPO, GRPO, workflows)
-    if [[ "$file" == *"areal/engine/ppo/"* ]] || \
+    if [[ "$file" == *"areal/trainer/ppo/"* ]] || \
        [[ "$file" == *"areal/workflow/"* ]] || \
        [[ "$file" == *"areal/reward/"* ]]; then
         reminder_file="algorithm-expert.md"

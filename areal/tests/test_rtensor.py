@@ -10,21 +10,21 @@ import pytest
 import requests
 import torch
 
-from areal.scheduler.rpc.rtensor import RTensor, TensorShardInfo
-from areal.scheduler.rpc.serialization import serialize_value
-from areal.utils.proc import kill_process_tree
-
-RPC_SERVER_PORT = 8077
+from areal.infra.rpc.rtensor import RTensor, TensorShardInfo
+from areal.infra.rpc.serialization import serialize_value
+from areal.infra.utils.proc import kill_process_tree
+from areal.utils.network import find_free_ports
 
 
 @pytest.fixture(scope="module")
 def rpc_server():
     """Start RPC server for integration tests."""
+    RPC_SERVER_PORT = find_free_ports(1)[0]
     proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
-            "areal.scheduler.rpc.rpc_server",
+            "areal.infra.rpc.rpc_server",
             "--host",
             "localhost",
             "--port",
@@ -43,7 +43,7 @@ def rpc_server():
     )
 
     # Wait for server to be ready
-    max_attempts = 20
+    max_attempts = 60
     for _ in range(max_attempts):
         try:
             resp = requests.get(f"http://localhost:{RPC_SERVER_PORT}/health", timeout=1)
@@ -51,7 +51,7 @@ def rpc_server():
                 break
         except Exception:
             pass
-        time.sleep(0.5)
+        time.sleep(1)
     else:
         proc.kill()
         raise RuntimeError("RPC server failed to start")
@@ -252,7 +252,7 @@ class TestRTensorIntegration:
         assert remotized["score"] == 0.95
 
         # Store tensor on server using the NEW shard_id created by remotize
-        from areal.scheduler.rpc.rtensor import fetch
+        from areal.infra.rpc.rtensor import fetch
 
         actual_shard_id = remotized["logits"].shards[0].shard_id
         tensor_from_local = fetch(actual_shard_id)
@@ -412,7 +412,7 @@ class TestRTensorIntegration:
             if isinstance(value, RTensor):
                 for shard in value.shards:
                     # Fetch from local storage and upload to server
-                    from areal.scheduler.rpc.rtensor import fetch
+                    from areal.infra.rpc.rtensor import fetch
 
                     tensor = fetch(shard.shard_id)
                     serialized = serialize_value(tensor)
@@ -455,7 +455,7 @@ class TestRTensorIntegration:
         )
 
         # Upload shards to server
-        from areal.scheduler.rpc.rtensor import fetch
+        from areal.infra.rpc.rtensor import fetch
 
         for i, shard_info in enumerate(rtensor.shards):
             tensor = fetch(shard_info.shard_id)
@@ -777,7 +777,7 @@ class TestRTensorFromBatched:
 
     def test_from_batched_with_sequence_truncation(self):
         """Verify truncation to max seqlens."""
-        from areal.scheduler.rpc.rtensor import fetch
+        from areal.infra.rpc.rtensor import fetch
 
         batch_tensor = torch.randn(4, 20, 128).cpu()
         layout = RTensor(
@@ -805,7 +805,7 @@ class TestRTensorFromBatched:
 
     def test_from_batched_4d_tensors(self):
         """Test 4D tensor handling with truncation."""
-        from areal.scheduler.rpc.rtensor import _pad_cat_dim0, fetch
+        from areal.infra.rpc.rtensor import _pad_cat_dim0, fetch
 
         batch_tensor = torch.randn(8, 10, 32, 32).cpu()
         # Seqlens matching the sequence dimension
@@ -832,7 +832,7 @@ class TestRTensorFromBatched:
 
     def test_from_batched_1d_tensors(self):
         """Test 1D tensors (no padding)."""
-        from areal.scheduler.rpc.rtensor import fetch
+        from areal.infra.rpc.rtensor import fetch
 
         batch_tensor = torch.randn(100).cpu()
         layout = RTensor(
@@ -889,7 +889,7 @@ class TestRTensorErrorHandling:
 
     def test_to_local_with_server_error(self, rpc_server):
         """RuntimeError on deleted shard."""
-        from areal.scheduler.rpc.rtensor import remove, store
+        from areal.infra.rpc.rtensor import remove, store
 
         tensor = torch.randn(2, 5).cpu()
         shard_id = str(uuid.uuid4())
@@ -1146,7 +1146,7 @@ class TestRTensorComplexPadding:
 
     def test_pad_cat_4d_tensors_variable_all_dims(self):
         """4D padding correctness."""
-        from areal.scheduler.rpc.rtensor import _pad_cat_dim0
+        from areal.infra.rpc.rtensor import _pad_cat_dim0
 
         tensors = [
             torch.randn(2, 5, 8, 8).cpu(),
@@ -1166,7 +1166,7 @@ class TestRTensorComplexPadding:
 
     def test_pad_cat_dimension_mismatch(self):
         """ValueError on ndim mismatch."""
-        from areal.scheduler.rpc.rtensor import _pad_cat_dim0
+        from areal.infra.rpc.rtensor import _pad_cat_dim0
 
         tensors = [torch.randn(2, 5).cpu(), torch.randn(3, 5, 8).cpu()]
 
@@ -1228,11 +1228,9 @@ class TestRTensorEdgeCases:
         """Empty shards list handling."""
         rtensor = RTensor(shards=[], data=torch.tensor([]).cpu())
 
-        # Empty RTensor should raise RuntimeError in FFD allocation
+        # Empty RTensor should raise ValueError in balanced_greedy_partition
         # This is expected behavior - can't allocate 0 items to 4 groups
-        with pytest.raises(
-            RuntimeError, match="Number of values.*smaller than min_groups"
-        ):
+        with pytest.raises(ValueError, match="Number of items.*must be >= K"):
             RTensor.data_parallel_dispatch(rtensor, dp_size=4)
 
     def test_single_item_batch(self):

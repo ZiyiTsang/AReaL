@@ -1,4 +1,4 @@
-# CLAUDE.md — AReaL
+# CLAUDE.md - AReaL
 
 ## WHAT: Project Overview
 
@@ -9,15 +9,21 @@ learning.
 
 **Core Directories**:
 
-- `areal/` — Core package
-  - `api/` — Config dataclasses, workflow/engine contracts
-  - `engine/` — FSDP2, Megatron, SGLang/vLLM adapters
-  - `workflow/` — RolloutWorkflow implementations
-  - `reward/` — Reward functions
-  - `dataset/` — Dataset loaders
-  - `utils/` — Logging, tensor ops, checkpoints
-- `examples/` — Training scripts and configs
-- `docs/` — Jupyter Book source
+- `areal/` - Core package
+  - `api/` - Config dataclasses, workflow/engine contracts
+  - `engine/` - FSDP2, Megatron, SGLang/vLLM adapters
+    - `fsdp_utils/` - FSDP2-specific utilities (checkpoint, grad, optimizer, parallel)
+    - `megatron_utils/` - Megatron/FP8 utilities (checkpoint, pipeline, quantization)
+    - `core/` - Engine-shared utilities (distributed, lock, model, offload)
+  - `infra/` - Infrastructure (launcher, scheduler, RPC)
+    - `utils/` - Infrastructure utilities (launcher, proc, http, concurrent, slurm, ray)
+  - `workflow/` - RolloutWorkflow implementations
+  - `reward/` - Reward functions
+  - `dataset/` - Dataset loaders
+  - `utils/` - Cross-cutting utilities (logging, data, checkpoints, network, RL
+    functional)
+- `examples/` - Training scripts and configs
+- `docs/` - Jupyter Book source
 
 ## WHY: Purpose
 
@@ -42,6 +48,8 @@ pre-commit install            # Set up hooks (run once)
 pre-commit run --all-files    # Format and lint
 
 # Run tests
+# First check GPU availability (many tests require GPU)
+python -c "import torch; print('GPU available:', torch.cuda.is_available())"
 uv run pytest areal/tests/test_<topic>.py
 
 # Generate CLI docs
@@ -69,7 +77,8 @@ uv run python docs/generate_cli_docs.py
 - Adding new dependencies
 - Changing launcher or scheduler logic
 - Deleting or renaming public APIs
-- Running pytest tests (may require GPU/multi-node)
+- Running GPU/distributed tests (check GPU first:
+  `python -c "import torch; print('GPU available:', torch.cuda.is_available())"`)
 
 ### Never Do
 
@@ -85,9 +94,10 @@ uv run python docs/generate_cli_docs.py
 | Add Workflow           | `docs/customization/agent.md`, `areal/workflow/multi_turn.py` |
 | Add Dataset            | `docs/customization/`, `areal/dataset/gsm8k.py`               |
 | Add Reward             | `areal/api/reward_api.py`, `areal/reward/geometry3k.py`       |
+| Add Archon Model       | `areal/experimental/models/archon/qwen2/`, `qwen3/`           |
 | Algorithm Details      | `docs/algorithms/*.md`                                        |
 | Quickstart             | `docs/tutorial/quickstart.md`                                 |
-| Architecture Deep Dive | `docs/lite/gsm8k_grpo.md`                                     |
+| Architecture Deep Dive | `docs/tutorial/gsm8k_grpo.md`                                 |
 | CLI Reference          | `docs/cli_reference.md`                                       |
 
 ## Git Workflow
@@ -131,6 +141,7 @@ Skills provide step-by-step guides for common development tasks:
 - `/add-dataset` - Dataset loader creation guide
 - `/add-workflow` - Workflow implementation guide
 - `/add-reward` - Reward function guide
+- `/add-archon-model` - Archon engine model architecture guide
 - `/debug-distributed` - Distributed debugging guide
 - `/add-unit-tests` - Test development guide (NEW)
 

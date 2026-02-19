@@ -17,11 +17,11 @@ from areal.api.cli_args import (
 from areal.api.io_struct import LocalInfServerInfo
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.infra import RolloutController
-from areal.scheduler.local import LocalScheduler
-from areal.scheduler.rpc.rtensor import RTensor
+from areal.infra.rpc.rtensor import RTensor
+from areal.infra.scheduler.local import LocalScheduler
+from areal.infra.utils.proc import kill_process_tree
 from areal.tests.utils import get_model_path
 from areal.utils import network, seeding
-from areal.utils.proc import kill_process_tree
 
 # =============================================================================
 # Test Configuration
@@ -118,11 +118,17 @@ def local_scheduler(tmp_path):
     if not has_gpu():
         pytest.skip("GPU required for LocalScheduler")
 
+    fileroot = tmp_path / "fileroot"
+    fileroot.mkdir()
+    name_resolve_root = tmp_path / "name_resolve"
+    name_resolve_root.mkdir()
     scheduler = LocalScheduler(
         gpu_devices=[0],
         log_dir=str(tmp_path),
         experiment_name=EXPR_NAME,
         trial_name=TRIAL_NAME,
+        fileroot=str(fileroot),
+        nfs_record_root=str(name_resolve_root),
     )
     yield scheduler
     scheduler.delete_workers(None)

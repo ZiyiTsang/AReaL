@@ -55,8 +55,8 @@ def _get_logger() -> logging.Logger:
 
 
 def _get_op_sac_save_list() -> set[torch._ops.OpOverload]:
-    # Import varlen_attention to register torch.ops.areal._varlen_attn
-    from areal.experimental.models.archon import varlen_attention as _  # noqa: F401
+    # Import varlen to register torch.ops.areal._varlen_attn custom op
+    from areal.experimental.models.archon.attention import varlen as _  # noqa: F401
 
     return {
         torch.ops.aten.mm.default,
@@ -575,7 +575,7 @@ def _apply_compile(model: Compilable, ep_enabled: bool = False) -> None:
                                 moe_submod, backend="inductor", fullgraph=True
                             ),
                         )
-                elif attr_name == "attention_norm" or attr_name == "ffn_norm":
+                elif attr_name in ("attention_norm", "ffn_norm"):
                     # NOTE: attention_norm/ffn_norm may use SequenceParallel
                     # which has issues with torch.compile + Inductor
                     # SequenceParallel has async redistribute which breaks

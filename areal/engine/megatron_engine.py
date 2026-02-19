@@ -48,6 +48,23 @@ from areal.engine.core import (
     compute_total_loss_weight,
     reorder_and_pad_outputs,
 )
+from areal.engine.core.distributed import init_custom_process_group
+from areal.engine.core.model import disable_dropout_in_model
+from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
+from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
+from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
+from areal.engine.megatron_utils.megatron import (
+    all_gather_param,
+    convert_to_hf,
+    get_named_parameters,
+    remove_padding,
+)
+from areal.engine.megatron_utils.packed_context_parallel import (
+    packed_context_parallel_forward,
+)
+from areal.engine.megatron_utils.pipeline_parallel import (
+    configure_pipeline_layer_splits,
+)
 from areal.infra.dist_rollout import DistRolloutCoordinator
 from areal.infra.platforms import current_platform
 from areal.models.mcore.hf_load import load_weights_from_hf_with_mbridge_fast
@@ -56,14 +73,11 @@ from areal.models.mcore.registry import make_hf_and_mcore_config, make_mcore_mod
 from areal.models.tree_attn.functional import (
     _gather_packed_tree_logprobs,
     gather_packed_tree_logprobs_entropy,
+    gather_packed_tree_vocab_stats,
     merge_packed_tree_results,
 )
 from areal.models.tree_attn.module import (
-    BLOCK_SIZE,
-    TRITON_AVAILABLE,
-    USE_TRITON_TREE_ATTN,
-    build_block_mask_from_trie,
-    build_triton_attn_data_from_trie,
+    build_tree_attn_kwargs,
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
@@ -82,33 +96,17 @@ from areal.utils.data import (
     split_padded_tensor_dict_into_mb_list,
     unpad_logits,
 )
-from areal.utils.distributed import init_custom_process_group
-from areal.utils.fp8 import FP8BlockwiseTensorHelper
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
 from areal.utils.hf_utils import load_hf_tokenizer
 from areal.utils.lock import DistributedLock
-from areal.utils.mcore.determinisitc import set_deterministic_algorithms
-from areal.utils.mcore.packed_context_parallel import (
-    packed_context_parallel_forward,
-)
-from areal.utils.mcore.pipeline_parallel import configure_pipeline_layer_splits
-from areal.utils.megatron import (
-    all_gather_param,
-    convert_to_hf,
-    get_named_parameters,
-    remove_padding,
-)
-from areal.utils.megatron_checkpointer import MegatronCheckpointManager
-from areal.utils.model import disable_dropout_in_model
 from areal.utils.network import find_free_ports, gethostip
 from areal.utils.offload import is_tms_enabled, torch_memory_saver
 from areal.utils.perf_tracer import trace_perf, trace_scope
 from areal.utils.seeding import get_seed
 
 if TYPE_CHECKING:
+    from areal.api.cli_args import PPOActorConfig, PPOCriticConfig
     from areal.api.scheduler_api import Scheduler
-    from areal.engine.ppo.actor import PPOActorConfig
-    from areal.engine.ppo.critic import PPOCriticConfig
 
 
 class _MegatronModelList(list):
@@ -573,32 +571,33 @@ class MegatronEngine(TrainEngine):
 
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
-            # Lazily create tree attention metadata just before forward
+            # Lazily create tree attention metadata just before forward.
+            # dense_mask=True because Megatron's gradient checkpointing uses
+            # save_for_backward() which can only save torch.Tensor objects;
+            # BlockMask is recreated inside PytorchFlexAttention.forward().
+            tree_attn_keys: list[str] = []
             if self.enable_tree_training:
                 trie_node = mb_input.padded_mb.get("trie_node", None)
+                # Ensure trie_node is also in orig_mb for _compute_logprobs_and_loss
+                if trie_node is not None and "trie_node" not in mb_input.orig_mb:
+                    mb_input.orig_mb["trie_node"] = trie_node
                 padded_size = mb_input.padded_to_length
-                if trie_node is not None and padded_size is not None:
-                    if USE_TRITON_TREE_ATTN and TRITON_AVAILABLE:
-                        triton_attn_data = build_triton_attn_data_from_trie(
-                            trie_node, padded_size
-                        )
-                        mb_input.padded_mb["triton_attn_data"] = triton_attn_data
-                    else:
-                        block_mask = build_block_mask_from_trie(
-                            trie_node,
-                            padded_size,
-                            mb_input.padded_mb["input_ids"].device,
-                        )
-                        mb_input.padded_mb["block_mask"] = block_mask
+                if trie_node is not None:
+                    assert padded_size is not None
+                    tree_kwargs = build_tree_attn_kwargs(
+                        trie_node,
+                        padded_size,
+                        mb_input.padded_mb["input_ids"].device,
+                        dense_mask=True,
+                    )
+                    mb_input.padded_mb.update(tree_kwargs)
+                    tree_attn_keys = list(tree_kwargs.keys())
 
             output = packed_context_parallel_forward(model, mb_input.padded_mb)
 
             # Release tree attention metadata after forward pass
-            if self.enable_tree_training:
-                if "block_mask" in mb_input.padded_mb:
-                    del mb_input.padded_mb["block_mask"]
-                if "triton_attn_data" in mb_input.padded_mb:
-                    del mb_input.padded_mb["triton_attn_data"]
+            for key in tree_attn_keys:
+                del mb_input.padded_mb[key]
 
             def _process_output(input_, output_):
                 loss = process_output_fn(output_, input_)
@@ -1373,14 +1372,12 @@ class MegatronEngine(TrainEngine):
             assert cp_size == 1, (
                 "Context parallelism is not supported in tree training."
             )
-            # Build tree inputs
-            assert BLOCK_SIZE % tp_size == 0, (
-                f"BLOCK_SIZE ({BLOCK_SIZE}) must be divisible by tensor parallel size ({tp_size})."
-            )
             mb_list = build_packed_tree_batch(
                 input_,
                 mb_spec=self.config.mb_spec,
                 pad_to_maximum=self.config.pad_to_maximum,
+                dp_group=self.data_parallel_group,
+                parallel_size=tp_size,
             )
             recommended_min_n_mbs = 2 * pp_size if pp_size > 1 else 1
             self.logger.info(
@@ -1466,9 +1463,24 @@ class MegatronEngine(TrainEngine):
             )
         if not self.config.is_critic:
             if self.enable_tree_training:
+                # Handle dummy trie (empty tree for DP synchronization)
+                # When trie has no sequences, return zero loss with grad connection
+                trie_node = inputs.get("trie_node")
+                if trie_node is None or not trie_node.all_sequence_ids:
+                    # Return zero loss that maintains gradient connection to output
+                    # This ensures backward() works correctly for distributed synchronization
+                    return output.sum() * 0.0
+
+                # For tree training, use gather_packed_tree_vocab_stats to properly
+                # unpack vocab stats from tree structure back to per-sequence format.
+                # This is necessary because the logits are in packed tree format where
+                # multiple sequences share prefix positions.
+                vocab_min_logits, vocab_max_logits = gather_packed_tree_vocab_stats(
+                    output, trie_node
+                )
                 logprobs, entropy = gather_packed_tree_logprobs_entropy(
                     output,
-                    inputs["trie_node"],
+                    trie_node,
                     inputs["input_ids"],
                     temperature=self.config.temperature,
                     tp_group=mpu.get_tensor_model_parallel_group()
@@ -1485,7 +1497,15 @@ class MegatronEngine(TrainEngine):
                     if mpu.get_tensor_model_parallel_world_size() > 1
                     else None,
                 )
-            loss = loss_fn(logprobs, entropy, inputs)
+                vocab_min_logits = output.detach().min(-1).values.float()
+                vocab_max_logits = output.detach().max(-1).values.float()
+            loss = loss_fn(
+                logprobs,
+                entropy,
+                inputs,
+                vocab_min_logits=vocab_min_logits,
+                vocab_max_logits=vocab_max_logits,
+            )
         else:
             values = output.squeeze(-1)
             loss = loss_fn(values, inputs)
@@ -1538,7 +1558,7 @@ class MegatronPPOActor(MegatronEngine):
     """PPO Actor implementation using Megatron backend."""
 
     def __init__(self, config: PPOActorConfig):
-        from areal.engine.ppo.actor import PPOActor
+        from areal.trainer.ppo.actor import PPOActor
 
         super().__init__(config)
         self.actor = PPOActor(config, self)
@@ -1556,7 +1576,7 @@ class MegatronPPOActor(MegatronEngine):
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):
-        from areal.engine.ppo.actor import PPOActorController
+        from areal.trainer.ppo.actor import PPOActorController
 
         return PPOActorController(train_engine=cls, config=config, scheduler=scheduler)
 
@@ -1565,7 +1585,7 @@ class MegatronPPOCritic(MegatronEngine):
     """PPO Critic implementation using Megatron backend."""
 
     def __init__(self, config: PPOCriticConfig):
-        from areal.engine.ppo.critic import PPOCritic
+        from areal.trainer.ppo.critic import PPOCritic
 
         super().__init__(config)
         self.critic = PPOCritic(config, self)
@@ -1579,7 +1599,7 @@ class MegatronPPOCritic(MegatronEngine):
 
     @classmethod
     def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):
-        from areal.engine.ppo.critic import PPOCriticController
+        from areal.trainer.ppo.critic import PPOCriticController
 
         return PPOCriticController(train_engine=cls, config=config, scheduler=scheduler)
 
@@ -1588,7 +1608,7 @@ class MegatronLMEngine(MegatronEngine):
     """Language model engine for SFT using Megatron backend."""
 
     def __init__(self, config: TrainEngineConfig):
-        from areal.engine.sft.lm_engine import LMEngine
+        from areal.trainer.sft.lm_engine import LMEngine
 
         super().__init__(config)
         self.lm_engine = LMEngine(self)
@@ -1601,7 +1621,7 @@ class MegatronLMEngine(MegatronEngine):
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
-        from areal.engine.sft.lm_engine import LMController
+        from areal.trainer.sft.lm_engine import LMController
 
         return LMController(train_engine=cls, config=config, scheduler=scheduler)
 
@@ -1612,7 +1632,7 @@ class MegatronRWEngine(MegatronEngine):
     def __init__(self, config: TrainEngineConfig):
         from copy import deepcopy
 
-        from areal.engine.rw.rw_engine import RWEngine
+        from areal.trainer.rw.rw_engine import RWEngine
 
         super().__init__(config)
         self.rw_engine = RWEngine(self)
@@ -1630,6 +1650,6 @@ class MegatronRWEngine(MegatronEngine):
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
-        from areal.engine.rw.rw_engine import RWController
+        from areal.trainer.rw.rw_engine import RWController
 
         return RWController(train_engine=cls, config=config, scheduler=scheduler)

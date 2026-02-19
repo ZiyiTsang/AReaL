@@ -400,8 +400,8 @@ class ArchonEngineConfig:
     attn_type: str = field(
         default="varlen",
         metadata={
-            "help": "Attention backend type.",
-            "choices": ["varlen", "sdpa"],
+            "help": "Attention backend type. Use 'tree' for tree training.",
+            "choices": ["varlen", "sdpa", "tree"],
         },
     )
 
@@ -453,6 +453,58 @@ class ArchonEngineConfig:
             "help": "(Testing only) Capture AC debug information. Will be slower."
         },
     )
+
+    # Pipeline Parallel Schedule
+    pp_schedule: str = field(
+        default="Interleaved1F1B",
+        metadata={
+            "help": "Pipeline parallel schedule type.",
+            "choices": ["1F1B", "Interleaved1F1B", "ZBVZeroBubble"],
+        },
+    )
+    # NOTE: The following three PP layer distribution parameters are advanced options
+    # that most users do not need to configure. The defaults work well for typical cases.
+    # TODO: Consider simplifying or refactoring these parameters in the future.
+    # Currently kept for consistency with Megatron's pipeline parallel configuration.
+    pp_layers_per_stage: int | None = field(
+        default=None,
+        metadata={
+            "help": "Number of transformer layers per (virtual) pipeline stage. "
+            "If set, num_virtual_stages is calculated from num_layers. "
+            "If None, stages are inferred from schedule type "
+            "(1 stage/rank for 1F1B, 2 stages/rank for Interleaved1F1B/ZBVZeroBubble).",
+        },
+    )
+    pp_first_stage_less_layers: int = field(
+        default=1,
+        metadata={
+            "help": "Number of layers to reduce in the first pipeline stage. "
+            "Accounts for embedding layer overhead.",
+        },
+    )
+    pp_last_stage_less_layers: int = field(
+        default=1,
+        metadata={
+            "help": "Number of layers to reduce in the last pipeline stage. "
+            "Accounts for output layer overhead.",
+        },
+    )
+
+    def __post_init__(self):
+        if self.pp_layers_per_stage is not None and self.pp_layers_per_stage < 1:
+            raise ValueError(
+                f"pp_layers_per_stage must be >= 1, got {self.pp_layers_per_stage}"
+            )
+        if self.pp_first_stage_less_layers < 0:
+            raise ValueError(
+                f"pp_first_stage_less_layers must be >= 0, "
+                f"got {self.pp_first_stage_less_layers}"
+            )
+        if self.pp_last_stage_less_layers < 0:
+            raise ValueError(
+                f"pp_last_stage_less_layers must be >= 0, "
+                f"got {self.pp_last_stage_less_layers}"
+            )
 
 
 # These configurations are used by Megatron Bridge to build Megatron models.
@@ -830,15 +882,13 @@ class TrainEngineConfig:
     # Tree training
     enable_tree_training: bool = field(
         default=False,
-        metadata={
-            "help": "Enable tree training with flex attention module. Not supported for Archon engine yet."
-        },
+        metadata={"help": "Enable tree training with flex attention module."},
     )
 
     # Scheduling
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
-            SchedulingSpec(cmd="python -m areal.scheduler.rpc.rpc_server"),
+            SchedulingSpec(cmd="python -m areal.infra.rpc.rpc_server"),
         ),
         metadata={
             "help": "Train engine schedule specs. Can accept 1 or 2 SchedulingSpec: "
@@ -1241,7 +1291,6 @@ class SGLangConfig:
     # NOTE: These arguments will be parsed into a dict json-string
     # and passed as `model_loader_extra_config` to SGLang.
     enable_multithread_load: bool = False
-    enable_fast_load: bool = False
 
     # Internal field, not exposed to users.
     enable_return_routed_experts: bool = False
@@ -1288,20 +1337,14 @@ class SGLangConfig:
     ):
         # Map "all-linear" to "all"
         args: dict = conf_as_dict(sglang_config)
-        if sglang_config.enable_multithread_load or sglang_config.enable_fast_load:
-            if not pkg_version.is_version_equal("sglang", "0.5.2"):
-                raise RuntimeError(
-                    "Customized model loading requires exact SGLang version 0.5.2"
-                )
+        if sglang_config.enable_multithread_load:
             model_loader_extra_config = dict(
                 enable_multithread_load=sglang_config.enable_multithread_load,
-                enable_fast_load=sglang_config.enable_fast_load,
             )
             args["model_loader_extra_config"] = json.dumps(
                 model_loader_extra_config, separators=(",", ":")
             )
         args.pop("enable_multithread_load", None)
-        args.pop("enable_fast_load", None)
         # Map "all-linear" to "all"
         if "lora_target_modules" in args and args["lora_target_modules"]:
             args["lora_target_modules"] = [
@@ -1341,7 +1384,7 @@ class SGLangConfig:
 
 @dataclass
 class OpenAIProxyConfig:
-    """Configuration for OpenAI proxy when using AgentWorkflow workflows."""
+    """Configuration for OpenAI proxy when using agent workflows."""
 
     mode: str = field(
         default="inline",
@@ -1382,7 +1425,11 @@ class OpenAIProxyConfig:
     export_style: str = field(
         default="individual",
         metadata={
-            "help": "Export style: 'individual' (all interactions) or 'concat' (leaf nodes only).",
+            "help": "Export style: 'individual' (all interactions) or 'concat' (leaf nodes only). "
+            "The 'individual' style exports each interaction (input-output-reward) step separately, "
+            "and treats them as independent samples to train the model. "
+            "The 'concat' style exports only the final concatenated trajectory from the root. "
+            "It is only suitable for linear conversation histories without token mismatching (whether valid depends on the tokenizer).",
             "choices": ["individual", "concat"],
         },
     )
@@ -1477,7 +1524,7 @@ class InferenceEngineConfig:
     )
     scheduling_spec: tuple[SchedulingSpec, ...] = field(
         default_factory=lambda: (
-            SchedulingSpec(cmd="python -m areal.scheduler.rpc.rpc_server"),
+            SchedulingSpec(cmd="python -m areal.infra.rpc.rpc_server"),
         ),
         metadata={
             "help": "inference engine schedule specs. Can accept 1 or 2 SchedulingSpec: "
@@ -1500,7 +1547,7 @@ class InferenceEngineConfig:
     openai: OpenAIProxyConfig | None = field(
         default=None,
         metadata={
-            "help": "OpenAI proxy configuration (used when workflow is AgentWorkflow)."
+            "help": "OpenAI proxy configuration (used when workflow is an agent workflow)."
         },
     )
 
@@ -1547,6 +1594,26 @@ class EvaluatorConfig(_Timer):
 class SaverConfig(_Timer):
     """Configuration for model checkpoint saving scheduling and timing."""
 
+    mode: str = field(
+        default="auto",
+        metadata={
+            "help": "Checkpoint save mode for HF saves. "
+            "'auto': use async for Archon engine, sync for others (default). "
+            "'sync': always synchronous. "
+            "'async': always process-based async with pinned memory staging, "
+            "extra CPU pinned memory "
+            "proportional to per-rank model shard size "
+            "(e.g., ~17.5GB/rank for 70B model on 8 GPUs). "
+            "Non-Archon engines fall back to sync with a warning.",
+            "choices": ["auto", "sync", "async"],
+        },
+    )
+
+    def __post_init__(self):
+        valid_modes = {"auto", "sync", "async"}
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid mode '{self.mode}'. Valid: {valid_modes}")
+
 
 @dataclass
 class RecoverConfig(_Timer):
@@ -1557,16 +1624,23 @@ class RecoverConfig(_Timer):
         metadata={
             "help": "Recovery mode for the launcher. "
             "Options: "
-            "'disabled': Never recover from previous runs. "
-            "'auto': Automatically recover from previous runs if recover info and checkpoints are available. "
-            "'fault': Only recover from previous runs if the new run fails. "
-            "'resume': Force to resume, raise an error if no recover info was found. Never resume if failed again."
+            "'on' or 'auto': Automatically recover from previous runs if recover info and checkpoints are available. "
+            "'off' or 'disabled': Never recover from previous runs."
         },
     )
     retries: int = field(
         default=3,
-        metadata={"help": "Number of recovery retries (auto/fault modes only)."},
+        metadata={"help": "Number of recovery retries when recovery is enabled."},
     )
+
+    def __post_init__(self):
+        valid_modes = {"on", "off", "auto", "disabled"}
+        if self.mode not in valid_modes:
+            raise ValueError(
+                f"Invalid recover mode '{self.mode}'. "
+                f"Valid options: {valid_modes}. "
+                f"Note: 'fault' and 'resume' modes have been removed."
+            )
 
 
 @dataclass
