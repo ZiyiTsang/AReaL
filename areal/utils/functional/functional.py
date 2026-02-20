@@ -213,7 +213,7 @@ def ppo_actor_loss_fn(
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
     enable_MIS_TIS_correction: bool = False,
-    engine_mismatch_IS_mode: str = "sequence_mask",
+    engine_mismatch_IS_mode: str = "token_mask",
     engine_mismatch_IS_cap: float = 3.0,
 ) -> tuple[torch.Tensor, dict]:
     """

@@ -373,7 +373,7 @@ def grpo_loss_fn(
     sapo_tau_neg: float = 1.05,
     use_decoupled_loss: bool = False,
     enable_MIS_TIS_correction: bool = False,
-    engine_mismatch_IS_mode: str = "sequence_mask",
+    engine_mismatch_IS_mode: str = "token_mask",
     engine_mismatch_IS_cap: float = 3.0,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,

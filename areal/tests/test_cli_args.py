@@ -1,6 +1,10 @@
+# Import directly from cli_args module to avoid importing areal package
+import sys
+
 import pytest
 
-from areal.api.cli_args import PPOActorConfig
+sys.path.insert(0, "/F00120250029/lixiang_share/zengziyi_share/zengziyi/Research/AReaL")
+from areal.api.cli_args import PPOActorConfig, PPOConfig, validation_cfg
 
 
 class TestPPOActorConfigEngineIS:
@@ -8,39 +12,55 @@ class TestPPOActorConfigEngineIS:
 
     def test_engine_is_requires_decoupled_or_recompute(self):
         """Test that enable_MIS_TIS_correction=True requires decoupled or recompute."""
-        # Should raise when enable_MIS_TIS_correction=True without decoupled or recompute
-        with pytest.raises(ValueError, match="enable_MIS_TIS_correction=True requires"):
-            PPOActorConfig(
+        # Create config with invalid combination
+        config = PPOConfig(
+            experiment_name="test",
+            trial_name="test",
+            actor=PPOActorConfig(
                 experiment_name="test",
                 trial_name="test",
                 path="/test/path",
                 enable_MIS_TIS_correction=True,
                 use_decoupled_loss=False,
                 prox_logp_method="loglinear",  # not recompute
-            )
+            ),
+        )
+        # Should raise when validation_cfg is called
+        with pytest.raises(ValueError, match="enable_MIS_TIS_correction=True requires"):
+            validation_cfg(config)
 
     def test_engine_is_works_with_decoupled(self):
         """Test that enable_MIS_TIS_correction works with decoupled loss."""
-        config = PPOActorConfig(
+        config = PPOConfig(
             experiment_name="test",
             trial_name="test",
-            path="/test/path",
-            enable_MIS_TIS_correction=True,
-            use_decoupled_loss=True,
+            actor=PPOActorConfig(
+                experiment_name="test",
+                trial_name="test",
+                path="/test/path",
+                enable_MIS_TIS_correction=True,
+                use_decoupled_loss=True,
+            ),
         )
-        assert config.enable_MIS_TIS_correction is True
+        validation_cfg(config)  # Should not raise
+        assert config.actor.enable_MIS_TIS_correction is True
 
     def test_engine_is_works_with_recompute(self):
         """Test that enable_MIS_TIS_correction works with recompute."""
-        config = PPOActorConfig(
+        config = PPOConfig(
             experiment_name="test",
             trial_name="test",
-            path="/test/path",
-            enable_MIS_TIS_correction=True,
-            use_decoupled_loss=False,
-            prox_logp_method="recompute",
+            actor=PPOActorConfig(
+                experiment_name="test",
+                trial_name="test",
+                path="/test/path",
+                enable_MIS_TIS_correction=True,
+                use_decoupled_loss=False,
+                prox_logp_method="recompute",
+            ),
         )
-        assert config.enable_MIS_TIS_correction is True
+        validation_cfg(config)  # Should not raise
+        assert config.actor.enable_MIS_TIS_correction is True
 
     def test_engine_is_defaults(self):
         """Test default values for engine_is parameters."""

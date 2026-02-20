@@ -1039,7 +1039,7 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
     engine_mismatch_IS_mode: str = field(
-        default="sequence_mask",
+        default="token_mask",
         metadata={
             "help": "Importance sampling correction mode for train-inference mismatch. "
             "'token_truncate': clamp token ratio to [0, cap]. "
@@ -1101,17 +1101,6 @@ class PPOActorConfig(TrainEngineConfig):
         return (self.use_decoupled_loss and not method.skips_forward_pass()) or (
             not self.use_decoupled_loss and self.recompute_logprob
         )
-
-    def __post_init__(self):
-        """Validate TIS/MIS configuration."""
-        if self.enable_MIS_TIS_correction:
-            if not self.use_decoupled_loss and self.prox_logp_method != "recompute":
-                raise ValueError(
-                    "enable_MIS_TIS_correction=True requires either "
-                    "use_decoupled_loss=True or prox_logp_method='recompute'. "
-                    f"Got use_decoupled_loss={self.use_decoupled_loss}, "
-                    f"prox_logp_method='{self.prox_logp_method}'"
-                )
 
 
 @dataclass
@@ -2081,6 +2070,27 @@ def to_structured_cfg(cfg, config_cls):
     return cfg
 
 
+def validation_cfg(cfg: PPOConfig) -> None:
+    """Validate configuration after it's fully loaded.
+
+    This function is called after OmegaConf.to_object() to ensure
+    all YAML values have been properly merged into the config.
+    """
+    # Validate PPOActorConfig MIS/TIS correction settings
+    actor = cfg.actor
+    if actor.enable_MIS_TIS_correction:
+        if not actor.use_decoupled_loss and actor.prox_logp_method != "recompute":
+            raise ValueError(
+                "enable_MIS_TIS_correction=True requires either "
+                "use_decoupled_loss=True or prox_logp_method='recompute'. "
+                f"Got use_decoupled_loss={actor.use_decoupled_loss}, "
+                f"prox_logp_method='{actor.prox_logp_method}'"
+            )
+    # ADD MORE VALIDATION RULES IF NEEDED
+    # RULE 2...
+    # RULE 3...
+
+
 def load_expr_config[ConfigT](
     argv: list[str], config_cls: type[ConfigT]
 ) -> tuple[ConfigT, str]:
@@ -2088,6 +2098,8 @@ def load_expr_config[ConfigT](
     cfg = to_structured_cfg(cfg, config_cls=config_cls)
     cfg = OmegaConf.to_object(cfg)
     assert isinstance(cfg, config_cls)
+    # Validate configuration
+    validation_cfg(cfg)
     # Setup environment
 
     name_resolve.reconfigure(cfg.cluster.name_resolve)
