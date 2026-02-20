@@ -141,7 +141,7 @@ def _compute_sequence_level_ratio_and_advantages(
     return ratio, advantages
 
 
-def compute_is_ratio_with_engine_is(
+def compute_engine_mismatch_IS_ratio(
     training_logprobs: torch.Tensor,
     inference_logprobs: torch.Tensor,
     mode: str,
@@ -153,7 +153,7 @@ def compute_is_ratio_with_engine_is(
 
     This computes the IS ratio between training (recomputed) logprobs and inference logprobs
     to correct for train-inference mismatch. The ratio is computed as:
-        is_ratio = exp(training_logprobs - inference_logprobs)
+        Mismatch_IS_ratio = exp(training_logprobs - inference_logprobs)
 
     Args:
         training_logprobs: Proximal/training logprobs (recomputed from training engine)
@@ -167,14 +167,14 @@ def compute_is_ratio_with_engine_is(
         IS ratio tensor with same shape as logprobs
     """
     # Compute raw IS ratio: exp(prox_logp - old_logp)
-    is_log_ratio = training_logprobs - inference_logprobs
+    IS_log_ratio = training_logprobs - inference_logprobs
 
     if "sequence" in mode:
         # Sequence-level: compute geometric mean ratio per sequence first
-        # Use a dummy advantages tensor (all zeros) since we only need the ratio
-        dummy_advantages = torch.zeros_like(is_log_ratio)
-        is_ratio_seq, _ = _compute_sequence_level_ratio_and_advantages(
-            is_log_ratio,
+        # Use a dummy advantages tensor (all zeros) since we only compute seq-level ratio nor advantages
+        dummy_advantages = torch.zeros_like(IS_log_ratio)
+        IS_ratio_seq, _ = _compute_sequence_level_ratio_and_advantages(
+            IS_log_ratio,
             dummy_advantages,
             loss_mask,
             cu_seqlens,
@@ -182,20 +182,22 @@ def compute_is_ratio_with_engine_is(
 
         # Now apply cap/mask on sequence-level ratio
         if "truncate" in mode:
-            is_ratio_seq = is_ratio_seq.clamp(min=0.0, max=cap)
+            IS_ratio_seq = IS_ratio_seq.clamp(min=0.0, max=cap)
         else:  # mask
-            is_ratio_seq = torch.where(is_ratio_seq > cap, 0.0, is_ratio_seq)
+            IS_ratio_seq = torch.where(IS_ratio_seq > cap, 0.0, IS_ratio_seq)
 
         # Apply loss_mask to get final output
-        return torch.where(loss_mask, is_ratio_seq, 0.0)
+        return torch.where(loss_mask, IS_ratio_seq, 0.0)
     else:
         # Token-level
-        is_ratio = torch.exp(is_log_ratio)
+        Mismatch_IS_ratio = torch.exp(IS_log_ratio)
         if "truncate" in mode:
-            is_ratio = is_ratio.clamp(min=0.0, max=cap)
+            Mismatch_IS_ratio = Mismatch_IS_ratio.clamp(min=0.0, max=cap)
         else:  # mask
-            is_ratio = torch.where(is_ratio > cap, 0.0, is_ratio)
-        return torch.where(loss_mask, is_ratio, 0.0)
+            Mismatch_IS_ratio = torch.where(
+                Mismatch_IS_ratio > cap, 0.0, Mismatch_IS_ratio
+            )
+        return torch.where(loss_mask, Mismatch_IS_ratio, 0.0)
 
 
 def ppo_actor_loss_fn(
@@ -210,9 +212,9 @@ def ppo_actor_loss_fn(
     behav_imp_weight_cap: float | None = None,
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
-    engine_is_correction: bool = False,
-    engine_is_mode: str = "sequence_mask",
-    engine_is_cap: float = 3.0,
+    enable_MIS_TIS_correction: bool = False,
+    engine_mismatch_IS_mode: str = "sequence_mask",
+    engine_mismatch_IS_cap: float = 3.0,
 ) -> tuple[torch.Tensor, dict]:
     """
     When decoupled loss is disabled:
@@ -230,9 +232,9 @@ def ppo_actor_loss_fn(
             Required when inputs are 1D and importance_sampling_level='sequence'.
             Shape: [batch_size + 1], where cu_seqlens[i] marks the start of sequence i.
             Not needed for 2D padded inputs (sequences identified by batch dimension).
-        engine_is_correction: Enable TIS/MIS correction for train-inference mismatch.
-        engine_is_mode: Mode for IS correction - "token_truncate", "token_mask", "sequence_truncate", "sequence_mask"
-        engine_is_cap: Cap value for IS correction.
+        enable_MIS_TIS_correction: Enable TIS/MIS correction for train-inference mismatch.
+        engine_mismatch_IS_mode: Mode for IS correction - "token_truncate", "token_mask", "sequence_truncate", "sequence_mask"
+        engine_mismatch_IS_cap: Cap value for IS correction.
     """
     loss_mask_count = loss_mask.count_nonzero() or 1
 
@@ -252,18 +254,18 @@ def ppo_actor_loss_fn(
         )
 
     # TIS/MIS: Compute IS ratio for train-inference mismatch correction
-    # This is different from the PPO ratio - it compares training vs inference logprobs
-    if engine_is_correction:
-        is_ratio = compute_is_ratio_with_engine_is(
+    Mismatch_IS_ratio = (
+        compute_engine_mismatch_IS_ratio(
             training_logprobs=proximal_logprobs,
             inference_logprobs=old_logprobs,
-            mode=engine_is_mode,
-            cap=engine_is_cap,
+            mode=engine_mismatch_IS_mode,
+            cap=engine_mismatch_IS_cap,
             loss_mask=loss_mask,
             cu_seqlens=cu_seqlens,
         )
-    else:
-        is_ratio = None
+        if enable_MIS_TIS_correction
+        else None
+    )
 
     clipped_ratio = torch.clamp(
         ratio,
@@ -293,9 +295,8 @@ def ppo_actor_loss_fn(
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
 
-    # Apply TIS/MIS correction: multiply by IS ratio for train-inference mismatch
-    if is_ratio is not None:
-        pg_loss = pg_loss * is_ratio
+    if Mismatch_IS_ratio is not None:
+        pg_loss = pg_loss * Mismatch_IS_ratio
 
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
@@ -312,8 +313,8 @@ def ppo_actor_loss_fn(
         stat["behave_imp_weight"] = behav_imp_weight
         stat["behave_approx_kl"] = behav_kl
         stat["behave_mask"] = behav_mask
-    if is_ratio is not None:
-        stat["engine_is_ratio"] = is_ratio
+    if Mismatch_IS_ratio is not None:
+        stat["engine_mismatch_IS_ratio"] = Mismatch_IS_ratio
     return pg_loss, stat
 
 

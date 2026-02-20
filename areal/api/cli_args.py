@@ -1031,14 +1031,14 @@ class PPOActorConfig(TrainEngineConfig):
         },
     )
     # TIS/MIS: Training-Inference Matching Importance Sampling
-    engine_is_correction: bool = field(
+    enable_MIS_TIS_correction: bool = field(
         default=False,
         metadata={
             "help": "Enable importance sampling correction for train-inference mismatch (TIS/MIS). "
             "Requires use_decoupled_loss=True or prox_logp_method='recompute'."
         },
     )
-    engine_is_mode: str = field(
+    engine_mismatch_IS_mode: str = field(
         default="sequence_mask",
         metadata={
             "help": "Importance sampling correction mode for train-inference mismatch. "
@@ -1054,11 +1054,11 @@ class PPOActorConfig(TrainEngineConfig):
             ],
         },
     )
-    engine_is_cap: float = field(
+    engine_mismatch_IS_cap: float = field(
         default=3.0,
         metadata={
             "help": "Cap value for importance sampling correction. "
-            "Tokens/sequences with ratio > cap are truncated or masked based on engine_is_mode."
+            "Tokens/sequences with ratio > cap are truncated or masked based on engine_mismatch_IS_mode."
         },
     )
     # Proximal Log-Probability Computation Method
@@ -1104,10 +1104,10 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate TIS/MIS configuration."""
-        if self.engine_is_correction:
+        if self.enable_MIS_TIS_correction:
             if not self.use_decoupled_loss and self.prox_logp_method != "recompute":
                 raise ValueError(
-                    "engine_is_correction=True requires either "
+                    "enable_MIS_TIS_correction=True requires either "
                     "use_decoupled_loss=True or prox_logp_method='recompute'. "
                     f"Got use_decoupled_loss={self.use_decoupled_loss}, "
                     f"prox_logp_method='{self.prox_logp_method}'"
