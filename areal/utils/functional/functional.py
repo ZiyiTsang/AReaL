@@ -153,7 +153,7 @@ def compute_engine_mismatch_IS_ratio(
 
     This computes the IS ratio between training (recomputed) logprobs and inference logprobs
     to correct for train-inference mismatch. The ratio is computed as:
-        Mismatch_IS_ratio = exp(training_logprobs - inference_logprobs)
+        engine_mismatch_IS_ratio = exp(training_logprobs - inference_logprobs)
 
     Args:
         training_logprobs: Proximal/training logprobs (recomputed from training engine)
@@ -190,14 +190,14 @@ def compute_engine_mismatch_IS_ratio(
         return torch.where(loss_mask, IS_ratio_seq, 0.0)
     else:
         # Token-level
-        Mismatch_IS_ratio = torch.exp(IS_log_ratio)
+        engine_mismatch_IS_ratio = torch.exp(IS_log_ratio)
         if "truncate" in mode:
-            Mismatch_IS_ratio = Mismatch_IS_ratio.clamp(min=0.0, max=cap)
+            engine_mismatch_IS_ratio = engine_mismatch_IS_ratio.clamp(min=0.0, max=cap)
         else:  # mask
-            Mismatch_IS_ratio = torch.where(
-                Mismatch_IS_ratio > cap, 0.0, Mismatch_IS_ratio
+            engine_mismatch_IS_ratio = torch.where(
+                engine_mismatch_IS_ratio > cap, 0.0, engine_mismatch_IS_ratio
             )
-        return torch.where(loss_mask, Mismatch_IS_ratio, 0.0)
+        return torch.where(loss_mask, engine_mismatch_IS_ratio, 0.0)
 
 
 def ppo_actor_loss_fn(
@@ -254,7 +254,7 @@ def ppo_actor_loss_fn(
         )
 
     # TIS/MIS: Compute IS ratio for train-inference mismatch correction
-    Mismatch_IS_ratio = (
+    engine_mismatch_IS_ratio = (
         compute_engine_mismatch_IS_ratio(
             training_logprobs=proximal_logprobs,
             inference_logprobs=old_logprobs,
@@ -295,8 +295,8 @@ def ppo_actor_loss_fn(
     behav_imp_weight = torch.where(behav_mask, behav_imp_weight, 0.0)
     pg_loss = pg_loss * behav_imp_weight
 
-    if Mismatch_IS_ratio is not None:
-        pg_loss = pg_loss * Mismatch_IS_ratio
+    if engine_mismatch_IS_ratio is not None:
+        pg_loss = pg_loss * engine_mismatch_IS_ratio
 
     logging_loss = pg_loss.detach()
     pg_loss = torch.where(loss_mask, pg_loss, 0).sum() / loss_mask_count
@@ -313,8 +313,8 @@ def ppo_actor_loss_fn(
         stat["behave_imp_weight"] = behav_imp_weight
         stat["behave_approx_kl"] = behav_kl
         stat["behave_mask"] = behav_mask
-    if Mismatch_IS_ratio is not None:
-        stat["engine_mismatch_IS_ratio"] = Mismatch_IS_ratio
+    if engine_mismatch_IS_ratio is not None:
+        stat["engine_mismatch_IS_ratio"] = engine_mismatch_IS_ratio
     return pg_loss, stat
 
 
