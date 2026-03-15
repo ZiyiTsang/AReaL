@@ -54,16 +54,15 @@ dependencies = [
     "openai-agents",
     "anthropic",
     "claude-agent-sdk",
+    "iflow-sdk",
     "litellm[proxy]>=1.81.3",
     "openhands",
     "langchain",
     "langchain-openai",
-
     # Visualization
     "pandas",
     "matplotlib",
     "seaborn",
-
     # Utilities and data processing
     "setproctitle",
     "nltk",
@@ -103,7 +102,6 @@ dependencies = [
     "prettytable",
     "h5py",
     "mathruler==0.1.0",
-
     # Monitoring and logging
     "wandb",
     "tensorboardx",
@@ -111,18 +109,15 @@ dependencies = [
     "colorlog",
     "swanboard==0.1.9b1",
     "swanlab[dashboard]==0.6.12",
-
     # Distributed computing
     "ray[default]",
     "redis",
-
     # Web frameworks
     "fastapi>=0.115.12",
     "uvicorn",
     "uvloop>=0.21.0",
     "flask",
     "tenacity",
-
     # Build and packaging tools
     "build>=1.2.1",
     "wheel>=0.43.0",
