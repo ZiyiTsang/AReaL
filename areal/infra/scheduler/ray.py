@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import shlex
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import ray
 import ray.exceptions
+import requests
 from ray.runtime_env import RuntimeEnv
 from ray.util.placement_group import (
     PlacementGroup,
@@ -24,12 +29,14 @@ from areal.api.cli_args import (
 from areal.infra.rpc.ray_rpc_server import RayRPCServer
 from areal.infra.scheduler.exceptions import (
     EngineCallError,
+    PortAllocationError,
     WorkerCreationError,
     WorkerFailedError,
     WorkerNotFoundError,
     WorkerTimeoutError,
 )
 from areal.infra.utils.launcher import get_env_vars, get_thread_env_vars
+from areal.infra.utils.proc import kill_process_tree, run_with_streaming_logs
 from areal.infra.utils.ray import get_placement_group_master_ip_and_port
 from areal.infra.utils.ray_placement_group import (
     DeferredDeviceRayPlacementStrategy,
@@ -39,6 +46,7 @@ from areal.infra.utils.ray_placement_group import (
     ray_resource_type,
 )
 from areal.utils import logging
+from areal.utils.network import find_free_ports, format_hostport, gethostip
 from areal.utils.offload import get_tms_env_vars
 
 logger = logging.getLogger("RayScheduler")
@@ -47,12 +55,13 @@ logger = logging.getLogger("RayScheduler")
 @dataclass
 class RayWorkerInfo:
     worker: Worker
-    actor: ray.actor.ActorHandle
+    actor: ray.actor.ActorHandle | None  # None for Guard subprocesses
     role: str
-    placement_group: PlacementGroup
+    placement_group: PlacementGroup | None
     bundle_index: int | None
     created_at: float
     env_vars: dict[str, str] = field(default_factory=dict)
+    process: subprocess.Popen | None = None  # Guard subprocess only
 
 
 class RayScheduler(Scheduler):
@@ -74,6 +83,7 @@ class RayScheduler(Scheduler):
         self._workers: dict[str, list[RayWorkerInfo]] = defaultdict(list)
         self._worker_info_by_id: dict[str, RayWorkerInfo] = {}
         self._placement_groups: list[PlacementGroup] = []
+        self._allocated_ports: set[int] = set()
 
         # Colocation tracking: colocated roles reuse workers from target role
         self._colocated_roles: dict[str, str] = {}  # colocated_role -> target_role
@@ -104,9 +114,37 @@ class RayScheduler(Scheduler):
     def _ping_workers(self, role: str, timeout: float | None = None):
         worker_info_list = self._workers[role]
         timeout = timeout if timeout is not None else self.startup_timeout
-        refs = [wi.actor.ping.remote() for wi in worker_info_list]
 
-        ref_to_worker = {ref: wi for wi, ref in zip(worker_info_list, refs)}
+        # Separate Ray actors from Guard subprocesses
+        ray_workers = [wi for wi in worker_info_list if wi.actor is not None]
+        guard_workers = [wi for wi in worker_info_list if wi.actor is None]
+
+        # Ping Guard subprocesses via HTTP health check
+        for wi in guard_workers:
+            port = int(wi.worker.worker_ports[0])
+            url = f"http://{format_hostport(wi.worker.ip, port)}/health"
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if wi.process is not None and wi.process.poll() is not None:
+                    raise WorkerFailedError(
+                        wi.worker.id, wi.process.returncode, "Guard process exited"
+                    )
+                try:
+                    response = requests.get(url, timeout=2.0)
+                    if response.status_code == 200:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                raise WorkerTimeoutError(wi.worker.id, timeout)
+
+        if not ray_workers:
+            return
+
+        refs = [wi.actor.ping.remote() for wi in ray_workers]
+
+        ref_to_worker = {ref: wi for wi, ref in zip(ray_workers, refs)}
 
         pending = refs
         while pending:
@@ -141,6 +179,172 @@ class RayScheduler(Scheduler):
         )
         env.update(thread_env)
         return env
+
+    # -- Guard subprocess helpers (for data service roles) -------------------
+
+    def _allocate_ports(self, count: int) -> list[int]:
+        try:
+            ports = find_free_ports(count, exclude_ports=set(self._allocated_ports))
+            self._allocated_ports.update(ports)
+            return ports
+        except ValueError as e:
+            raise PortAllocationError(str(e)) from e
+
+    def _release_ports(self, ports: list[int]) -> None:
+        for port in ports:
+            self._allocated_ports.discard(port)
+
+    def _is_guard_ready(self, host: str, port: int) -> bool:
+        url = f"http://{format_hostport(host, port)}/health"
+        try:
+            response = requests.get(url, timeout=2.0)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def _create_guard_workers(
+        self,
+        role: str,
+        num_workers: int,
+        schedulings: list[SchedulingSpec],
+    ) -> list[str]:
+        """Create Guard subprocesses for data service roles.
+
+        Data service requires a real Guard process with HTTP server to manage
+        child processes via /fork, /alloc_ports, and /health endpoints.
+        Ray actors cannot fulfill this role.
+        """
+        worker_info_list: list[RayWorkerInfo] = []
+        worker_ids: list[str] = []
+
+        log_dir = Path("/tmp/areal/experiments/logs/ray_scheduler")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        merged_log = log_dir / "merged.log"
+
+        exp_name = "ray_scheduler"
+        trial_name = "default"
+        if self.exp_config is not None:
+            exp_name = self.exp_config.experiment_name
+            trial_name = self.exp_config.trial_name
+
+        nfs_root = "/tmp/areal/name_resolve"
+        etcd_addr = "localhost:2379"
+        fileroot = "/tmp/areal/experiments"
+        if self.exp_config is not None:
+            nfs_root = self.exp_config.cluster.name_resolve.nfs_record_root
+            etcd_addr = self.exp_config.cluster.name_resolve.etcd3_addr
+            fileroot = str(self.exp_config.fileroot)
+
+        for idx, spec in enumerate(schedulings):
+            worker_id = f"{role}/{idx}"
+            env = self._build_env_vars(spec)
+
+            try:
+                ports = self._allocate_ports(spec.port_count)
+            except PortAllocationError as e:
+                self._cleanup_guard_workers(worker_info_list)
+                raise WorkerCreationError(
+                    role, f"Port allocation failed for {worker_id}", str(e)
+                ) from e
+
+            if not spec.cmd:
+                self._release_ports(ports)
+                self._cleanup_guard_workers(worker_info_list)
+                raise WorkerCreationError(
+                    role, f"No command specified for {worker_id}"
+                )
+
+            cmd_prefix = shlex.split(spec.cmd)
+            if cmd_prefix[0].startswith("python"):
+                cmd_prefix[0] = sys.executable
+
+            cmd = [
+                *cmd_prefix,
+                "--port", str(ports[0]),
+                "--experiment-name", exp_name,
+                "--trial-name", trial_name,
+                "--role", role,
+                "--worker-index", str(idx),
+                "--name-resolve-type", "nfs",
+                "--nfs-record-root", nfs_root,
+                "--etcd3-addr", etcd_addr,
+                "--fileroot", fileroot,
+            ]
+
+            log_file = log_dir / f"{worker_id.replace('/', '_')}.log"
+
+            try:
+                process = run_with_streaming_logs(
+                    cmd,
+                    str(log_file),
+                    str(merged_log),
+                    worker_id,
+                    env_vars_in_cmd=env,
+                )
+            except Exception as e:
+                self._release_ports(ports)
+                self._cleanup_guard_workers(worker_info_list)
+                raise WorkerCreationError(
+                    role, f"Failed to spawn Guard for {worker_id}", str(e)
+                ) from e
+
+            host = gethostip()
+            worker = Worker(
+                id=worker_id,
+                ip=host,
+                worker_ports=[str(p) for p in ports],
+                engine_ports=[],
+            )
+            wi = RayWorkerInfo(
+                worker=worker,
+                actor=None,
+                role=role,
+                placement_group=None,
+                bundle_index=None,
+                created_at=time.time(),
+                env_vars=env,
+                process=process,
+            )
+
+            # Wait for Guard to be ready
+            start_time = time.time()
+            while time.time() - start_time < self.startup_timeout:
+                if process.poll() is not None:
+                    stderr = f"Guard process exited with code {process.returncode}"
+                    self._cleanup_guard_workers(worker_info_list)
+                    raise WorkerFailedError(worker_id, process.returncode, stderr)
+
+                if self._is_guard_ready(host, ports[0]):
+                    break
+
+                time.sleep(0.5)
+            else:
+                self._cleanup_guard_workers(worker_info_list)
+                raise WorkerTimeoutError(worker_id, self.startup_timeout)
+
+            worker_info_list.append(wi)
+            worker_ids.append(worker_id)
+            logger.info(
+                f"Guard worker {worker_id} started (PID: {process.pid}, "
+                f"ports: {ports})"
+            )
+
+        self._workers[role] = worker_info_list
+        for wi in worker_info_list:
+            self._worker_info_by_id[wi.worker.id] = wi
+
+        return worker_ids
+
+    def _cleanup_guard_workers(self, workers: list[RayWorkerInfo]) -> None:
+        for wi in workers:
+            if wi.process is not None:
+                try:
+                    kill_process_tree(wi.process.pid, timeout=5)
+                except Exception:
+                    pass
+                self._release_ports(
+                    [int(p) for p in wi.worker.worker_ports]
+                )
 
     def _get_placement_strategy(
         self, schedulings: list[SchedulingSpec]
@@ -497,7 +701,18 @@ class RayScheduler(Scheduler):
 
         if strategy_type != SchedulingStrategyType.separation:
             raise ValueError(f"Unknown scheduling strategy type: {strategy_type}")
-        # Non-colocated: spawn new worker actors
+
+        # Data service roles need a real Guard process with HTTP server.
+        # Ray actors cannot provide the /fork, /alloc_ports, /health endpoints
+        # that DataController relies on.
+        if role.startswith("data"):
+            worker_ids = self._create_guard_workers(role, num_workers, schedulings)
+            logger.info(
+                f"Successfully created {len(worker_ids)} Guard workers for role '{role}'"
+            )
+            return worker_ids
+
+        # Non-colocated: spawn new Ray actors
         worker_info_list, worker_ids = self._create_ray_workers(role, schedulings)
 
         self._workers[role].extend(worker_info_list)
@@ -649,10 +864,34 @@ class RayScheduler(Scheduler):
         3. Only after the barrier phase, remove the placement groups. PG
            removal hard-kills any still-alive actor process, so it must
            come last.
+
+        Guard subprocesses (data service roles) are killed directly via
+        ``kill_process_tree`` since they do not participate in Ray's
+        actor lifecycle.
         """
+        # Separate Ray actors from Guard subprocesses
+        ray_workers = [wi for wi in workers if wi.actor is not None]
+        guard_workers = [wi for wi in workers if wi.actor is None]
+
+        # Clean up Guard subprocesses first
+        for wi in guard_workers:
+            if wi.process is not None:
+                try:
+                    kill_process_tree(wi.process.pid, timeout=5)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to kill Guard subprocess {wi.worker.id}: {e}"
+                    )
+                self._release_ports(
+                    [int(p) for p in wi.worker.worker_ports]
+                )
+
+        if not ray_workers:
+            return
+
         # Phase 1: concurrently dispatch destroy on all actors.
         destroy_refs: list[tuple[RayWorkerInfo, Any]] = []
-        for wi in workers:
+        for wi in ray_workers:
             try:
                 ref = wi.actor.destroy.remote()
                 destroy_refs.append((wi, ref))
